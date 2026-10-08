@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">PulseFin</string>
+    <string name="app_name">Music</string>
 
     <!-- Shared errors -->
     <string name="error_action_failed">Something went wrong. Try again.</string>
