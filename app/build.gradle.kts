@@ -139,3 +139,16 @@ dependencies {
 
     testImplementation(libs.junit)
 }
+
+androidComponents {
+    onVariants { variant ->
+        variant.outputs.forEach { output ->
+            val fileName = if (variant.buildType == "release") {
+                "Music.apk"
+            } else {
+                "Music-Debug.apk"
+            }
+            output.outputFileName.set(fileName)
+        }
+    }
+}

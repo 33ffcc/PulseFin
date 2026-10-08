@@ -15,3 +15,6 @@
 *.jks
 /keystore.properties
 /gradle/gradle-daemon-jvm.properties
+app/release/baselineProfiles/0/Music.dm
+app/release/baselineProfiles/1/Music.dm
+app/release/output-metadata.json
