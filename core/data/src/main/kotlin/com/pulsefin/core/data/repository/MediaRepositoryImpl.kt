@@ -137,11 +137,8 @@ class MediaRepositoryImpl(
                     // instead of every type's fetch being cancelled and nothing committing.
                     var firstFailure: Throwable? = null
                     supervisorScope {
-                        val songsDeferred = async {
-                            runCatching { fetchAllItems(api, BaseItemKind.AUDIO).map { it.toSong(api).toEntity() } }
-                        }
                         val albumsDeferred = async {
-                            runCatching { fetchAllItems(api, BaseItemKind.MUSIC_ALBUM).map { it.toAlbum(api).toEntity() } }
+                            runCatching { fetchAllItems(api, BaseItemKind.MUSIC_ALBUM) }
                         }
                         val artistsDeferred = async {
                             runCatching { fetchAllItems(api, BaseItemKind.MUSIC_ARTIST).map { it.toArtist(api).toEntity() } }
@@ -154,8 +151,15 @@ class MediaRepositoryImpl(
                                     .map { it.toEntity() }
                             }
                         }
+                        val albumsDtoResult = albumsDeferred.await()
+                        val albumsResult = albumsDtoResult.map { list -> list.map { it.toAlbum(api) } }
+                        val albumEntities = albumsResult.getOrNull().orEmpty().map { it.toEntity() }
+                        val albumArtMap = albumsResult.getOrNull().orEmpty().associate { it.id.value to it.artworkUrl }
+
+                        val songsDeferred = async {
+                            runCatching { fetchAllItems(api, BaseItemKind.AUDIO).map { it.toSong(api, albumArtMap).toEntity() } }
+                        }
                         val songsResult = songsDeferred.await()
-                        val albumsResult = albumsDeferred.await()
                         val artistsResult = artistsDeferred.await()
                         val playlistsResult = playlistsDeferred.await()
                         // One outer transaction spanning every table this pass actually has fresh
@@ -171,7 +175,7 @@ class MediaRepositoryImpl(
                                 val liveIds = songs.mapTo(mutableSetOf()) { it.id }
                                 favoriteMutexes.keys.retainAll(liveIds)
                             }.onFailure { firstFailure = firstFailure ?: it }
-                            albumsResult.onSuccess { albumDao.replaceAll(it) }.onFailure { firstFailure = firstFailure ?: it }
+                            albumsResult.onSuccess { albumDao.replaceAll(albumEntities) }.onFailure { firstFailure = firstFailure ?: it }
                             artistsResult.onSuccess { artistDao.replaceAll(it) }.onFailure { firstFailure = firstFailure ?: it }
                             playlistsResult.onSuccess { playlistDao.replaceAll(it) }.onFailure { firstFailure = firstFailure ?: it }
                         }
@@ -194,13 +198,14 @@ class MediaRepositoryImpl(
         withContext(dispatchers.io) {
             apiResult {
                 val api = requireApi()
+                val dbAlbumArt = albumDao.getById(albumId)?.artworkUrl
                 api.itemsApi.getItems(
                     GetItemsRequest(
                         parentId = UUID.fromString(albumId),
                         includeItemTypes = listOf(BaseItemKind.AUDIO),
                         sortBy = listOf(ItemSortBy.SORT_NAME),
                     ),
-                ).content.items.orEmpty().map { it.toSong(api) }
+                ).content.items.orEmpty().map { it.toSong(api, mapOf(albumId to dbAlbumArt)) }
             }
         }
 
@@ -238,10 +243,11 @@ class MediaRepositoryImpl(
                         limit = 60,
                     ),
                 ).content.items.orEmpty()
+                val albumArtMap = albumDao.getAll().associate { it.id to it.artworkUrl }
                 SearchResults(
                     artists = items.filter { it.type == BaseItemKind.MUSIC_ARTIST }.map { it.toArtist(api) },
                     albums = items.filter { it.type == BaseItemKind.MUSIC_ALBUM }.map { it.toAlbum(api) },
-                    songs = items.filter { it.type == BaseItemKind.AUDIO }.map { it.toSong(api) },
+                    songs = items.filter { it.type == BaseItemKind.AUDIO }.map { it.toSong(api, albumArtMap) },
                 )
             }
         }
@@ -549,13 +555,13 @@ class MediaRepositoryImpl(
 
 // --- Jellyfin DTO -> domain ---
 
-private fun BaseItemDto.toSong(api: ApiClient): Song = Song(
+private fun BaseItemDto.toSong(api: ApiClient, albumArtMap: Map<String, String?> = emptyMap()): Song = Song(
     id = MediaId(id.toString()),
     title = name ?: "Unknown",
     albumName = album.orEmpty(),
     artistName = artists?.joinToString(", ")?.ifBlank { null } ?: albumArtist ?: "Unknown artist",
     durationMs = (runTimeTicks ?: 0L) / 10_000,
-    artworkUrl = artworkUrl(api),
+    artworkUrl = artworkUrl(api, albumArtMap),
     isFavorite = userData?.isFavorite ?: false,
 )
 
@@ -588,20 +594,41 @@ private suspend fun BaseItemDto.toPlaylist(api: ApiClient): Playlist {
     )
 }
 
-private fun BaseItemDto.artworkUrl(api: ApiClient): String? = runCatching {
-    // Only build a URL when the item actually has a Primary image (imageTags is the source of
-    // truth) — otherwise items with no art (e.g. an empty playlist) get a URL that 404s instead
-    // of null, which skips the UI's placeholder. The tag is also passed through as a cache-busting
-    // query param so Coil's URL-keyed cache can't serve stale bytes for a different item that
-    // happens to reuse the same id (observed with recreated same-named playlists).
-    val tag = imageTags?.get(ImageType.PRIMARY) ?: return@runCatching null
-    // Store the base URL only — deliberately WITHOUT an api_key, since this value is persisted
-    // verbatim to Room (and, via the playback queue, to on-disk queue state). Servers requiring
-    // authenticated image access 404 without a token, so callers that actually fetch the image
-    // (Coil, the playback MediaItem) attach one fresh via StreamUrlResolver.resolveArtworkUrl.
-    // Callers also append the size they need via sizedArtUrl (tiny for list thumbnails, larger
-    // for the Now Playing hero) so lists stay cheap to scroll.
-    api.imageApi.getItemImageUrl(itemId = id, imageType = ImageType.PRIMARY, tag = tag)
+private fun BaseItemDto.artworkUrl(api: ApiClient, albumArtMap: Map<String, String?> = emptyMap()): String? = runCatching {
+    // 1. Direct primary image on the item itself (imageTags is the source of truth for items with
+    // direct art, e.g. albums, artists, or individual track custom covers).
+    val directTag = imageTags?.get(ImageType.PRIMARY)
+    if (directTag != null) {
+        return@runCatching api.imageApi.getItemImageUrl(itemId = id, imageType = ImageType.PRIMARY, tag = directTag)
+    }
+
+    // 2. Audio tracks in Jellyfin usually inherit artwork from their parent album (albumId +
+    // albumPrimaryImageTag) or parent item (parentPrimaryImageItemId + parentPrimaryImageTag).
+    val albId = albumId
+    val albTag = albumPrimaryImageTag
+    if (albId != null && !albTag.isNullOrBlank()) {
+        return@runCatching api.imageApi.getItemImageUrl(itemId = albId, imageType = ImageType.PRIMARY, tag = albTag)
+    }
+
+    val parentIdStr = parentPrimaryImageItemId
+    val parentTag = parentPrimaryImageTag
+    if (!parentIdStr.isNullOrBlank() && !parentTag.isNullOrBlank()) {
+        val parentId = runCatching { UUID.fromString(parentIdStr) }.getOrNull()
+        if (parentId != null) {
+            return@runCatching api.imageApi.getItemImageUrl(itemId = parentId, imageType = ImageType.PRIMARY, tag = parentTag)
+        }
+    }
+
+    // 3. Fall back to parent album art from passed map
+    if (albId != null) {
+        val albIdStr = albId.toString()
+        val mappedArt = albumArtMap[albIdStr]
+        if (!mappedArt.isNullOrBlank()) {
+            return@runCatching mappedArt
+        }
+    }
+
+    null
 }.getOrNull()
 
 // --- domain <-> Room entity ---

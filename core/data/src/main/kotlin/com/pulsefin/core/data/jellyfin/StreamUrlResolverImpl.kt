@@ -17,8 +17,8 @@ class StreamUrlResolverImpl(private val apiProvider: JellyfinApiProvider) : Stre
     }
 
     override suspend fun resolveArtworkUrl(baseUrl: String): String? {
-        val api = apiProvider.api() ?: return null
-        return ensureApiKey(baseUrl, api.accessToken)
+        val token = apiProvider.currentAccessToken ?: return null
+        return ensureApiKey(baseUrl, token)
     }
 
     override fun attachAuthToken(baseUrl: String): String =

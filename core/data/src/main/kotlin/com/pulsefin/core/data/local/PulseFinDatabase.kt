@@ -94,6 +94,12 @@ interface AlbumDao {
     @Query("SELECT * FROM albums ORDER BY name")
     fun observeAll(): Flow<List<AlbumEntity>>
 
+    @Query("SELECT * FROM albums WHERE id = :id")
+    suspend fun getById(id: String): AlbumEntity?
+
+    @Query("SELECT * FROM albums")
+    suspend fun getAll(): List<AlbumEntity>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertAll(albums: List<AlbumEntity>)
 
