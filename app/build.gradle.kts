@@ -24,7 +24,7 @@ android {
     compileSdk = libs.versions.compileSdk.get().toInt()
 
     defaultConfig {
-        applicationId = "com.pulsefin.app"
+        applicationId = "org.grapheneos.music"
         minSdk = libs.versions.minSdk.get().toInt()
         targetSdk = libs.versions.targetSdk.get().toInt()
         versionCode = (project.findProperty("APP_VERSION_CODE") as? String)?.toInt() ?: 1
